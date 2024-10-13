@@ -43,6 +43,7 @@ def setup_logger(name=None):
     logger.addHandler(file_handler)
     logger.propagate = False
     logging.captureWarnings(True)
+    return logger
 
 def print_with_tabs(obj, num_tabs=1):
     # Convert the object to a string representation
@@ -59,7 +60,6 @@ def print_with_tabs(obj, num_tabs=1):
 
     # Join the tabbed lines back into a single string and print
     return "".join(tabbed_lines).rstrip("\n")
-
 
 # setup_logger('train_eval_hpo')
 logger = logging.getLogger('HPO_gpt2')
@@ -84,7 +84,8 @@ class Trainer:
                  val_max_steps: int = 500,
                  dtype: str = "float32",
                  zero_stage: int = 1,
-                 multi_objective: bool = False,):
+                 multi_objective: bool = False,
+                 logger_=None):
         # Initialize parameters
         self.config_space = config_space
         self.seed = seed
@@ -92,7 +93,7 @@ class Trainer:
         self.model_name = config_space['model']
         self.input_bin = input_bin
         self.input_val_bin = input_val_bin
-        self.batch_size = config_space["batch_size"] if "batch_size" in config_space else batch_size
+        self.batch_size = config_space["batch_size"] if "batch_size" in config_space.keys() else batch_size
         self.warmup_iters = warmup_iters
         self.learning_rate_decay_frac = learning_rate_decay_frac
         self.grad_clip = grad_clip
@@ -102,16 +103,15 @@ class Trainer:
         self.multi_objective = multi_objective
         self.ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
         self.save_name = str(self.model_name)[:2] \
-             + f"lr_{self.config_space['learning_rate']}_wd_{self.config_space['weight_decay']}_" \
+             + f"_lr_{self.config_space['learning_rate']}_wd_{self.config_space['weight_decay']}_" \
              + f"sl_{self.config_space['sequence_length']}_bs_{self.batch_size}_h_{self.config_space['n_head']}_" \
-             + f"l_{self.config_space['n_layer']}_em_{self.config_space['n_embd']}_seed_{self.seed}_bud_{self.budget}"
+             + f"l_{self.config_space['n_layer']}_em_{self.config_space['n_embd']}"
         self.step = 0
         self.time_elapsed = 0.0
         # Initialize WandB
 
         # Setup logging, device, and random seeds
-        setup_logger()
-        self.logger = logger
+        self.logger = setup_logger() if logger_ is None else logger_
         self._setup_ddp()
         self._set_seeds()
         
@@ -125,6 +125,8 @@ class Trainer:
         self.num_iterations = self.train_loader.ntok_total // self.total_batch_size
         self.run = self._init_wandb()
         
+        self._log_setup()
+        
         if os.path.exists("hp_details_w_embeddings.pkl"):
             with open("hp_details_w_embeddings.pkl", "rb") as f:
                 self.hp_details = pickle.load(f)
@@ -134,15 +136,16 @@ class Trainer:
     def _log_setup(self):
         section_tab = 3*"\t"
         print(f"Running train_eval_hpo with budget: {self.budget}, config_space: {self.config_space.get_dictionary()}, seed: {self.seed}")
-        logger.info(f"{section_tab}== Running train_eval_hpo ==")
+        self.logger.info(f"{section_tab}== Running train_eval_hpo ==")
         # log all the arguments
-        logger.info(f"{section_tab}== Arguments:\n"
+        self.logger.info(f"{section_tab}== Arguments:\n"
                     + section_tab + f"\tseed: {self.seed} \n"
                     + section_tab + f"\tbudget: {self.budget} \n"
                     + section_tab + f"\tinput_bin: {self.input_bin} \n"
                     + section_tab + f"\tinput_val_bin: {self.input_val_bin} \n"
                     + section_tab + f"\tmodel: {self.model_name} \n"
                     + section_tab + f"\tbatch_size: {self.batch_size} \n"
+                    + section_tab + f"\ttokens_per_fwdbwd: {self.tokens_per_fwdbwd} \n"
                     + section_tab + f"\ttotal_batch_size: {self.total_batch_size} \n"
                     + section_tab + f"\twarmup_iters: {self.warmup_iters} \n"
                     + section_tab + f"\tlearning_rate_decay_frac: {self.learning_rate_decay_frac} \n"
@@ -151,10 +154,10 @@ class Trainer:
                     + section_tab + f"\tdtype: {self.dtype} \n"
                     + section_tab + f"\tzero_stage: {self.zero_stage} \n")
         
-        logger.info(f"{section_tab}== configuration space:\n" 
+        self.logger.info(f"{section_tab}== configuration space:\n" 
             + section_tab + f"\tConfig_space:{self.config_space.get_dictionary()} \n")
         
-        logger.info(f"{section_tab}== Dataloaders setup:\n"
+        self.logger.info(f"{section_tab}== Dataloaders setup:\n"
             + section_tab + f"\ttrain_loader.ntok_total: {self.train_loader.ntok_total} \n"
             + section_tab + f"\tval_loader.ntok_total: {self.val_loader.ntok_total} \n"
             + section_tab + f"\tnum_iterations: {self.num_iterations} \n"
@@ -181,7 +184,7 @@ class Trainer:
                 "zero_stage": self.zero_stage,
                 "multi_objective": self.multi_objective
             },
-            name= self.save_name,
+            name= self.save_name + "_seed_" + str(self.seed) + "_bud_" + str(self.budget),
         )
 
     def _set_seeds(self):
@@ -254,9 +257,9 @@ class Trainer:
 
     def _init_dataloaders(self):
         train_loader = DistributedDataLoader(self.input_bin, self.batch_size, 
-                                             self.config_space['sequence_length'], ddp_rank=self.ddp_rank, ddp_world_size=self.ddp_world_size)
+                                             self.config_space['sequence_length'], process_rank=self.ddp_rank, num_processes=self.ddp_world_size)
         val_loader = DistributedDataLoader(self.input_val_bin, 1, 
-                                           1024, ddp_rank=0, ddp_world_size=1)
+                                           1024, process_rank=0, num_processes=1)
         return train_loader, val_loader
 
     def _get_optimizer(self):
@@ -297,7 +300,7 @@ class Trainer:
                 if (i+1) % 20 == 0:
                     print(f"Validation step: {i}/{num_steps} | Loss: {val_loss / (i+1)}") 
         
-        val_loss /= self.val_max_steps
+        val_loss /= num_steps
         return val_loss
 
     @classmethod
@@ -305,7 +308,11 @@ class Trainer:
         section_tab = 5*"\t"
         if trainer.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
-            
+        
+        trainer.logger.info(f"{section_tab}== Training ==\n")
+        print(f"== Training ==")
+        trainer.logger.info(f"{section_tab} device: {trainer.device}, dtype: {trainer.dtype}, ddprank: {trainer.ddp_rank}, ddpworldsize: {trainer.ddp_world_size}, ddp: {trainer.ddp}")
+        print(f"device: {trainer.device}, dtype: {trainer.dtype}, ddprank: {trainer.ddp_rank}, ddpworldsize: {trainer.ddp_world_size}, ddp: {trainer.ddp}")
         ctx = torch.amp.autocast(device_type=trainer.device, dtype=trainer.ptdtype) if trainer.device == "cuda" else nullcontext()
         num_iterations = trainer.train_loader.ntok_total // trainer.total_batch_size
         grad_accum_steps = trainer.total_batch_size // trainer.tokens_per_fwdbwd
@@ -366,18 +373,22 @@ class Trainer:
             timings.pop(0)
 
             if trainer.step % 200 == 0:
-                logger.info(f"{section_tab} \tStep: {trainer.step}/{num_iterations} | Loss: {lossf} | LR: {lr} | Norm: {norm}")
+                trainer.logger.info(f"{section_tab} \tStep: {trainer.step}/{num_iterations} | Loss: {lossf} | LR: {lr} | Norm: {norm}")
                 print(f"Step: {trainer.step}/{num_iterations} | Loss: {lossf} | LR: {lr} | Norm: {norm}")
-                wandb.log({"avg train loss": np.mean(training_losses), "lr": lr, "step":trainer.step, "remaining_time": trainer.budget - (trainer.time_elapsed + time.time() - start_time)})
+                wandb.log({"step_loss":lossf, "avg train loss": np.mean(training_losses), "lr": lr, "step":trainer.step, "remaining_time": trainer.budget - (trainer.time_elapsed + time.time() - start_time)})
             
-            if trainer.step % 2000 == 0:
-                val_loss = trainer.validate()
+            if trainer.step % 1000 == 0:
+                val_loss = trainer.validate(num_steps=100)
+                trainer.logger.info(f"{section_tab} \tValidation loss: {val_loss}")
+                print(f"Validation loss: {val_loss}")
                 wandb.log({"val_loss": val_loss, "step": trainer.step})
                 trainer._save_model(trainer.step, start_time, trainer.optimizer)
         
-        logger.info(f"{section_tab}== Training complete ==\n")
+        trainer.logger.info(f"{section_tab}== Training complete ==\n")
         
         val_loss = trainer.validate()
+        trainer.logger.info(f"{section_tab}Validation loss: {val_loss}")
+        print(f"Validation loss: {val_loss}")
         wandb.log({"val_loss": val_loss, "step": trainer.step})
         
         trainer.hp_details.append({

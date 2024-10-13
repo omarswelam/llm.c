@@ -20,6 +20,8 @@ import submitit
 import pickle
 import torch
 from smac.runhistory.dataclasses import TrialValue
+import math
+from types import SimpleNamespace
 
 global log_file_name
 
@@ -92,29 +94,194 @@ def plot_pareto(smac: AbstractFacade, incumbents: list[Configuration]) -> None:
     plt.savefig(f"pareto_front_{log_file_name}.png", format='png', dpi=300)  # Save as PNG with high resolution
     plt.show()
     
+    
+class SuccessiveHalvingCustom:
+    def __init__(self, config_space, min_budget, max_budget, logger, reduction_factor=2, n_initial=1, seed=42):
+        """
+        Initialize the Successive Halving algorithm.
 
-def main_smac(args):
-    
-    setup_logger('HPO_gpt2')
-    logger = logging.getLogger('HPO_gpt2')
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"  
-    logger.info(f'============Starting============\n')   
-    
-    # Define the configuration space
-    cs = ConfigurationSpace()
-    learning_rate = UniformFloatHyperparameter("learning_rate", 1e-6, 1e-4, default_value=1e-4, log=True)
-    weight_decay = UniformFloatHyperparameter("weight_decay", 1e-6, 0.1, default_value=0.01, log=True)
-    sequence_length = UniformIntegerHyperparameter("sequence_length", 256, 1024, default_value=1024)
-    batch_size = CategoricalHyperparameter("batch_size", [1, 2, 4, 8, 16, 32], default_value=4)
-    n_head = CategoricalHyperparameter("n_heads", [4, 6, 8, 10, 12], default_value=6)
-    n_layer = CategoricalHyperparameter("n_heads", [4, 6, 8, 10, 12], default_value=6)
-    n_embd = CategoricalHyperparameter("n_heads", [256, 384, 512, 768, 1024], default_value=384)
-    cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd])
+        Args:
+        - config_space: A configuration space object from which configurations can be sampled.
+        - min_budget (int): Minimum budget (e.g., minimum number of epochs or trials) per configuration.
+        - max_budget (int): Maximum budget per configuration.
+        - reduction_factor (int): How aggressively the algorithm reduces the number of configurations.
+        """
+        self.config_space = config_space  # Config space to sample from
+        self.min_budget = min_budget  # Minimum budget for any configuration
+        self.max_budget = max_budget  # Maximum budget for any configuration
+        self.reduction_factor = reduction_factor  # Controls the halving rate
+        self.rung = 0  # Keeps track of the current rung in the halving process
+        self.current_configs = []  # Configurations being evaluated in the current rung
+        self.results = []  # Stores the results of each evaluated configuration in the current rung
+        self.evaluations = {}  # Dictionary to store the final performance of each configuration across all rounds
+        self.config_history = []  # Stores every configuration that has been evaluated along with results
+        self.checkpoint_path = 'successive_halving_checkpoint.pkl'
+        
+        # Calculate the number of rungs (stages) in successive halving
+        self.num_rungs = int(math.log(max_budget / min_budget, reduction_factor)) + 1
 
+        self.num_initial_configs = max(int(self.reduction_factor ** (self.num_rungs - 1)), n_initial)
+        # Initial budget starts with the minimum budget
+        self.current_budget = self.min_budget
+        self.seed = seed
+        # Track total number of configurations sampled
+        self.total_configs_sampled = 0
+        
+        self.logger = logger
+        
+        self.logger.info(f"\t== SHA ConfigSpace ==\n\t{print_with_tabs(config_space,1)}")
+        self.logger.info(f"\t eta: {args.eta}")
+        self.logger.info(f"\t min_budget: {min_budget}")
+        self.logger.info(f"\t max_budget: {max_budget}")
+        self.logger.info(f"\t num_rungs: {self.num_rungs}")
+
+    
+    def ask(self):
+        """
+        Return the next configuration to evaluate with the current budget.
+        If the current rung has remaining configs, use those, otherwise sample new ones.
+        """
+        # If we have no more configs for this rung, sample new ones
+        if not self.current_configs:
+            num_configs = self._num_configs_for_rung(self.rung)
+            self.current_configs = [self.config_space.sample_configuration() for _ in range(num_configs)]
+            self.total_configs_sampled += num_configs
+        
+        # Return the next configuration to evaluate
+        config = self.current_configs[0]
+        return SimpleNamespace(config = config, budget = self.current_budget, seed = self.seed)
+
+    def tell(self, config, result, exception=""):
+        """
+        Receive the result of a configuration's evaluation.
+
+        Args:
+        - config: The configuration evaluated.
+        - result: The result (e.g., performance) of the configuration.
+        """
+        # Store the result for this configuration
+        self.results.append((config, result))
+        
+        # Record every evaluated config in the history (with budget)
+        self.config_history.append({'config': config, 'budget': self.current_budget, 'result': result, 'exception': exception})
+        
+        # Update the performance of the config (only keep the best result per config)
+        if config not in self.evaluations or self.evaluations[config] > result:
+            self.evaluations[config] = result
+            
+        self.current_configs.pop(0)
+        # If all configurations in the current rung are evaluated, proceed to the next rung
+        if len(self.results) == self._num_configs_for_rung(self.rung):
+            self._advance_rung()
+    
+    def _advance_rung(self):
+        """
+        Advance to the next rung, retaining only the top-performing configurations.
+        """
+        self.rung += 1
+        if self.rung >= self.num_rungs:
+            print("Successive Halving completed.")
+            return
+        
+        # Sort the configurations based on their results and keep the top fraction
+        self.results.sort(key=lambda x: x[1], reverse=False)
+        num_survivors = len(self.results) // self.reduction_factor
+        self.current_configs = [config for config, _ in self.results[:num_survivors]]
+        self.results = []
+        
+        # Increase the budget for the next rung
+        self.current_budget = self.min_budget * (self.reduction_factor ** self.rung)
+
+    def _num_configs_for_rung(self, rung):
+        """
+        Calculate the number of configurations for a given rung.
+        """
+        return max(1, self.num_initial_configs // (self.reduction_factor ** rung))
+
+    def is_done(self):
+        """
+        Check if the algorithm has finished evaluating all configurations.
+        """
+        return self.rung >= self.num_rungs
+
+    def save_state(self):
+        """
+        Save the current state of the algorithm to a checkpoint file.
+        """
+        state = {
+            'config_space': self.config_space,
+            'min_budget': self.min_budget,
+            'max_budget': self.max_budget,
+            'reduction_factor': self.reduction_factor,
+            'rung': self.rung,
+            'current_configs': self.current_configs,
+            'results': self.results,
+            'evaluations': self.evaluations,
+            'config_history': self.config_history,
+            'current_budget': self.current_budget,
+            'total_configs_sampled': self.total_configs_sampled,
+            'num_rungs': self.num_rungs,
+            'seed': self.seed,
+            'logger': self.logger,
+            'num_initial_configs': self.num_initial_configs
+        }
+        with open(self.checkpoint_path, 'wb') as f:
+            pickle.dump(state, f)
+    
+    def load_state(self):
+        """
+        Load the state of the algorithm from a checkpoint file.
+        """
+        try:
+            with open(self.checkpoint_path, 'rb') as f:
+                state = pickle.load(f)
+            
+            assert state['config_space'] == self.config_space
+            assert state['num_initial_configs'] == self.num_initial_configs
+            assert state['min_budget'] == self.min_budget
+            assert state['max_budget'] == self.max_budget
+            assert state['reduction_factor'] == self.reduction_factor
+            assert state['num_rungs'] == self.num_rungs
+            assert state['rung'] <= self.num_rungs
+            assert state['current_budget'] == self.min_budget * (self.reduction_factor ** state['rung'])
+            
+            self.config_space = state['config_space']
+            self.min_budget = state['min_budget']
+            self.max_budget = state['max_budget']
+            self.reduction_factor = state['reduction_factor']
+            self.num_rungs = state['num_rungs']
+            self.rung = state['rung']
+            self.current_configs = state['current_configs']
+            self.results = state['results']
+            self.evaluations = state['evaluations']
+            self.config_history = state['config_history']
+            self.current_budget = state['current_budget']
+            self.total_configs_sampled = state['total_configs_sampled']
+            self.seed = state['seed']
+            self.logger = state['logger']
+            print("State loaded successfully.")
+        except FileNotFoundError:
+            print("Checkpoint file not found. Starting from scratch.")
+        except AssertionError:
+            print("Checkpoint file does not match the current configuration. Starting from scratch.")
+    
+    def get_best_config(self):
+        """
+        Get the best configuration found so far.
+        """
+        if not self.evaluations:
+            return None
+        return max(self.evaluations.items(), key=lambda x: x[1])[0]
+
+    def get_config_history(self):
+        """
+        Get the history of all configurations evaluated with their results.
+        """
+        return self.config_history
+    
+def smac_object(args, cs, logger):
+    
     logger.info(f"\t== SMAC ConfigSpace ==\n\t{print_with_tabs(cs,1)}")
-
-
     if args.multiobjective:
         scenario = Scenario(
                     cs,
@@ -191,29 +358,65 @@ def main_smac(args):
     logger.info(f"\t eta: {args.eta}")
     logger.info("\t== Starting the optimization ==")
     
-    # Start the optimization
-    # incumbents = smac.optimize()
+    return smac
     
-    for i in range(args.n_trials):
-        info = smac.ask()
+def main_smac(args):
+    
+    setup_logger('HPO_gpt2')
+    logger = logging.getLogger('HPO_gpt2')
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"  
+    logger.info(f'============Starting============\n')   
+    
+    # Define the configuration space
+    cs = ConfigurationSpace()
+    model = Constant("model", value="custom")
+    learning_rate = UniformFloatHyperparameter("learning_rate", 1e-6, 1e-4, default_value=1e-4, log=True)
+    weight_decay = UniformFloatHyperparameter("weight_decay", 1e-6, 0.1, default_value=0.01, log=True)
+    sequence_length = UniformIntegerHyperparameter("sequence_length", 256, 1024, default_value=1024)
+    batch_size = CategoricalHyperparameter("batch_size", [1, 2, 4, 8, 16], default_value=4)
+    n_head = CategoricalHyperparameter("n_head", [4, 6, 8, 10, 12], default_value=6)
+    n_layer = CategoricalHyperparameter("n_layer", [4, 6, 8], default_value=6)
+    n_embd = CategoricalHyperparameter("n_embd", [240, 480, 720, 960, 1200], default_value=480)
+    # n_embd = CategoricalHyperparameter("n_embd", [256, 384, 512, 768, 1024], default_value=384)
+    cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd, model])
+
+    print(f"{'using SMAC for optimization' if args.smac else 'using Successive Halving for optimization'}")
+    
+    if args.smac:
+        sha = smac_object(args, cs, logger)
+    else:
+        sha = SuccessiveHalvingCustom(cs, min_budget=20*60, max_budget=23*60*60, logger=logger, reduction_factor=args.eta, n_initial=100)
+        if args.checkpoint:
+            sha.load_state()
+    
+    while not sha.is_done():
+        info = sha.ask()
         assert info.seed is not None
         # print(info)
-        experiment = Trainer(info.config, budget=info.budget, seed=info.seed)
-        cost = Trainer.train(experiment)
-        value = TrialValue(cost=cost, time=0.5)
+        experiment = Trainer(info.config, budget=info.budget, seed=info.seed, logger_=logger)
+        try:
+            cost = Trainer.train(experiment)
+            exception = ""
+        except Exception as e:
+            print(f"Exception: {e}")
+            cost = np.inf
+            exception = str(e)
+        value = TrialValue(cost=cost, time=0.5) if args.smac else cost
+        
+        if args.smac:
+            sha.tell(info.config, value)
+        else:
+            sha.tell(info.config, value, exception)
+            sha.save_state()
 
-        smac.tell(info, value)
-
-    incumbents = smac.intensifier.get_incumbents()
+    incumbents = sha.intensifier.get_incumbents()  if args.smac else sha.get_best_config()
     # Print the best configuration
     print(f"Best found configuration: {incumbents}")
     
-    if args.multiobjective:
-        plot_pareto(smac, incumbents)
-    
     global log_file_name
     pickle.dump(incumbents, open(f"{log_file_name}_incumbents_w_embedding.pkl", "wb"))
-    pickle.dump(smac, open(f"{log_file_name}_smac_w_embedding.pkl", "wb"))
+    pickle.dump(sha, open(f"{log_file_name}_sha_w_embedding.pkl", "wb"))
 
 
 
@@ -248,6 +451,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_trials", type=int, default=500, help="number of trials to evaluate")
     parser.add_argument("--eta", type=int, default=2, help="eta parameter for Hyperband")
     parser.add_argument("--surrogate", type=str, default="gp", help="surrogate model to use")
+    parser.add_argument("--smac", type=bool, default=False, help="use SMAC for optimization")
+    parser.add_argument("--checkpoint", type=bool, default=True, help="load checkpoint")
     args = parser.parse_args()
     
     if args.slurm == True:
