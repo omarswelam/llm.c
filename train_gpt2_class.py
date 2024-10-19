@@ -17,6 +17,7 @@ import pickle
 import logging
 import datetime
 import wandb
+import submitit
 
 
 def setup_logger(name=None):
@@ -64,6 +65,14 @@ def print_with_tabs(obj, num_tabs=1):
 # setup_logger('train_eval_hpo')
 logger = logging.getLogger('HPO_gpt2')
 
+gpt_configs = {
+    "d6": {"n_layer":6, "n_head":6, "n_embd":384},
+    "d12": {"n_layer":12, "n_head":12, "n_embd":768},
+    "d24": {"n_layer":24, "n_head":16, "n_embd":1024},
+    "d36": {"n_layer":36, "n_head":20, "n_embd":1280},
+    "d48": {"n_layer":48, "n_head":25, "n_embd":1600}
+    }
+
 import torch
 import wandb
 import time
@@ -76,6 +85,12 @@ class Trainer:
     def __init__(self, config_space, seed, budget, 
                  input_bin: str = "dev/data/fineweb10B/fineweb_train_*.bin",
                  input_val_bin: str = "dev/data/fineweb10B/fineweb_val_*.bin",
+                 learning_rate: float = 1e-4,
+                 weight_decay: float = 0.0,
+                 n_head: int = 12,
+                 n_layer: int = 12,
+                 n_embd: int = 768,
+                 sequence_length: int = 1024,
                  batch_size: int = 8,
                  total_batch_size: int = -1,
                  warmup_iters: int = 700,
@@ -85,15 +100,28 @@ class Trainer:
                  dtype: str = "float32",
                  zero_stage: int = 1,
                  multi_objective: bool = False,
-                 logger_=None):
-        # Initialize parameters
+                 model_name: str = "d6",
+                 logger_=None,
+                 **kwargs):
+        # Initialize parameters        
         self.config_space = config_space
+        self.model_name = config_space['model'] if "model" in config_space.keys() else model_name
+
+        if self.model_name != "custom":
+            for key in gpt_configs["d6"].keys():
+                self.config_space[key] = gpt_configs[self.model_name][key]
+                                    
         self.seed = seed
         self.budget = budget
-        self.model_name = config_space['model']
         self.input_bin = input_bin
         self.input_val_bin = input_val_bin
-        self.batch_size = config_space["batch_size"] if "batch_size" in config_space.keys() else batch_size
+        self.batch_size = self.config_space["batch_size"] if "batch_size" in self.config_space.keys() else batch_size
+        self.learning_rate = self.config_space["learning_rate"] if "learning_rate" in self.config_space.keys() else learning_rate
+        self.weight_decay = self.config_space["weight_decay"] if "weight_decay" in self.config_space.keys() else weight_decay
+        self.n_head = self.config_space["n_head"] if "n_head" in self.config_space.keys() else n_head
+        self.n_layer = self.config_space["n_layer"] if "n_layer" in self.config_space.keys() else n_layer
+        self.n_embd = self.config_space["n_embd"] if "n_embd" in self.config_space.keys() else n_embd
+        self.sequence_length = self.config_space["sequence_length"] if "sequence_length" in self.config_space.keys() else sequence_length
         self.warmup_iters = warmup_iters
         self.learning_rate_decay_frac = learning_rate_decay_frac
         self.grad_clip = grad_clip
@@ -102,10 +130,15 @@ class Trainer:
         self.zero_stage = zero_stage
         self.multi_objective = multi_objective
         self.ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-        self.save_name = str(self.model_name)[:2] \
-             + f"_lr_{self.config_space['learning_rate']}_wd_{self.config_space['weight_decay']}_" \
-             + f"sl_{self.config_space['sequence_length']}_bs_{self.batch_size}_h_{self.config_space['n_head']}_" \
-             + f"l_{self.config_space['n_layer']}_em_{self.config_space['n_embd']}"
+
+        if str(self.model_name) == "custom":
+            self.save_name = str(self.model_name) \
+                + f"_lr_{self.learning_rate}_wd_{self.weight_decay}_sl_{self.sequence_length}_bs_{self.batch_size}_" \
+                + f"h_{self.n_head}_l_{self.n_layer}_em_{self.n_embd}"
+        else:
+            self.save_name = str(self.model_name) \
+                + f"_lr_{self.learning_rate}_wd_{self.weight_decay}_sl_{self.sequence_length}_bs_{self.batch_size}" 
+                
         self.step = 0
         self.time_elapsed = 0.0
         # Initialize WandB
@@ -119,10 +152,9 @@ class Trainer:
         self._init_model()
         self.train_loader, self.val_loader = self._init_dataloaders()
         
-        self.tokens_per_fwdbwd = self.config_space['sequence_length'] * self.batch_size * self.ddp_world_size
+        self.tokens_per_fwdbwd = self.sequence_length * self.batch_size * self.ddp_world_size
         self.total_batch_size = total_batch_size if total_batch_size > 0 else self.tokens_per_fwdbwd
         assert self.total_batch_size % self.tokens_per_fwdbwd == 0, "total_batch_size must be a multiple of tokens_per_fwdbwd"
-        self.num_iterations = self.train_loader.ntok_total // self.total_batch_size
         self.run = self._init_wandb()
         
         self._log_setup()
@@ -133,9 +165,29 @@ class Trainer:
         else:
             self.hp_details = []
 
+        print("config_space", self.config_space)
+        print("model_name", self.model_name)
+        print("learning_rate", self.learning_rate)
+        print("weight_decay", self.weight_decay)
+        print("n_head", self.n_head)
+        print("n_layer", self.n_layer)
+        print("n_embd", self.n_embd)
+        print("sequence_length", self.sequence_length)
+        print("batch_size", self.batch_size)
+        print("total_batch_size", self.total_batch_size)
+        print("warmup_iters", self.warmup_iters)
+        print("learning_rate_decay_frac", self.learning_rate_decay_frac)
+        print("grad_clip", self.grad_clip)
+        print("val_max_steps", self.val_max_steps)
+        print("dtype", self.dtype)
+        print("zero_stage", self.zero_stage)
+        print("multi_objective", self.multi_objective)
+        print("seed", self.seed)
+        print("budget", self.budget)
+
     def _log_setup(self):
         section_tab = 3*"\t"
-        print(f"Running train_eval_hpo with budget: {self.budget}, config_space: {self.config_space.get_dictionary()}, seed: {self.seed}")
+        print(f"Running train_eval_hpo with budget: {self.budget}, config_space: {self.config_space.get_dictionary() if isinstance(self.config_space, ConfigurationSpace) else self.config_space}, seed: {self.seed}")
         self.logger.info(f"{section_tab}== Running train_eval_hpo ==")
         # log all the arguments
         self.logger.info(f"{section_tab}== Arguments:\n"
@@ -155,12 +207,11 @@ class Trainer:
                     + section_tab + f"\tzero_stage: {self.zero_stage} \n")
         
         self.logger.info(f"{section_tab}== configuration space:\n" 
-            + section_tab + f"\tConfig_space:{self.config_space.get_dictionary()} \n")
+            + section_tab + f"\tConfig_space:{self.config_space.get_dictionary() if isinstance(self.config_space, ConfigurationSpace) else self.config_space} \n")
         
         self.logger.info(f"{section_tab}== Dataloaders setup:\n"
             + section_tab + f"\ttrain_loader.ntok_total: {self.train_loader.ntok_total} \n"
             + section_tab + f"\tval_loader.ntok_total: {self.val_loader.ntok_total} \n"
-            + section_tab + f"\tnum_iterations: {self.num_iterations} \n"
             + section_tab + f"\tval_max_steps: {self.val_max_steps} \n")
         
     def _init_wandb(self):
@@ -168,7 +219,13 @@ class Trainer:
             project="LLMs",
             entity="o-swelam",
             config={
-                "config_space": self.config_space.get_dictionary(),
+                "config_space": self.config_space.get_dictionary() if isinstance(self.config_space, ConfigurationSpace) else self.config_space,
+                "learning_rate": self.learning_rate,
+                "weight_decay": self.weight_decay,
+                "n_head": self.n_head,
+                "n_layer": self.n_layer,
+                "n_embd": self.n_embd,
+                "sequence_length": self.sequence_length,
                 "seed": self.seed,
                 "budget": self.budget,
                 "input_bin": self.input_bin,
@@ -257,25 +314,25 @@ class Trainer:
 
     def _init_dataloaders(self):
         train_loader = DistributedDataLoader(self.input_bin, self.batch_size, 
-                                             self.config_space['sequence_length'], process_rank=self.ddp_rank, num_processes=self.ddp_world_size)
+                                             self.sequence_length, process_rank=self.ddp_rank, num_processes=self.ddp_world_size)
         val_loader = DistributedDataLoader(self.input_val_bin, 1, 
                                            1024, process_rank=0, num_processes=1)
         return train_loader, val_loader
 
     def _get_optimizer(self):
-        return self.model.configure_optimizers(weight_decay=self.config_space['weight_decay'],
-                                               learning_rate=self.config_space['learning_rate'], betas=(0.9, 0.95),
+        return self.model.configure_optimizers(weight_decay=self.weight_decay,
+                                               learning_rate=self.learning_rate, betas=(0.9, 0.95),
                                                device_type=self.device, zero_stage=self.zero_stage)
 
     def _get_lr(self, step, num_iterations):
-        min_lr = self.config_space["learning_rate"] * self.learning_rate_decay_frac
+        min_lr = self.learning_rate * self.learning_rate_decay_frac
         if step < self.warmup_iters:
-            return self.config_space["learning_rate"] * (step+1) / self.warmup_iters
+            return self.learning_rate * (step+1) / self.warmup_iters
         if step > num_iterations:
             return min_lr
         decay_ratio = (step - self.warmup_iters) / (num_iterations - self.warmup_iters)
         coeff = 0.5 * (1.0 + np.cos(np.pi * decay_ratio))
-        return min_lr + coeff * (self.config_space["learning_rate"] - min_lr)
+        return min_lr + coeff * (self.learning_rate - min_lr)
 
     def _save_model(self, step, start_time, optimizer):
         ckpt = {
@@ -353,7 +410,7 @@ class Trainer:
             lossf = lossf.item()
 
             norm = torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.grad_clip)
-            lr = trainer._get_lr(trainer.step, trainer.num_iterations)
+            lr = trainer._get_lr(trainer.step, num_iterations)
             for param_group in trainer.optimizer.param_groups:
                 param_group['lr'] = lr
 
@@ -396,12 +453,12 @@ class Trainer:
             "val_loss": val_loss, 
             "train_loss": np.mean(training_losses), "train_time": trainer.time_elapsed + time.time() - start_time, 
             "batch_size": trainer.batch_size, 
-            "learning_rate": trainer.config_space["learning_rate"],
-            "weight_decay": trainer.config_space["weight_decay"], 
-            "sequence_length": trainer.config_space["sequence_length"],
-            "n_head": trainer.config_space["n_head"],
-            "n_layer": trainer.config_space["n_layer"],
-            "n_embd": trainer.config_space["n_embd"],
+            "learning_rate": trainer.learning_rate,
+            "weight_decay": trainer.weight_decay, 
+            "sequence_length": trainer.sequence_length,
+            "n_head": trainer.n_head,
+            "n_layer": trainer.n_layer,
+            "n_embd": trainer.n_embd,
                        })
         
         with open(f"hp_details_w_embeddings.pkl", "wb") as f:
@@ -412,3 +469,98 @@ class Trainer:
             destroy_process_group()
             
         return val_loss
+    
+  
+def set_queue(q_, log_folder, maximum_runtime=None):
+    global ex
+    global q
+    if q_ == 'all':
+        q = 'alldlc_gpu-rtx2080'
+    if q_ == 'ml':
+        q = 'mldlc_gpu-rtx2080'
+    if q_ == 'mlhiwi':
+        q = "mlhiwidlc_gpu-rtx2080"
+
+    if maximum_runtime is None:
+        if q == 'alldlc_gpu-rtx2080' or q == 'mlhiwidlc_gpu-rtx2080':
+            maximum_runtime = 24*60*1-1
+        else:
+            maximum_runtime = 24*60*4-1
+
+    ex = submitit.AutoExecutor(folder=log_folder)
+    ex.update_parameters(timeout_min=maximum_runtime,
+                        slurm_partition=q, #  mldlc_gpu-rtx2080
+                        slurm_signal_delay_s=180, # time to pass the USR2 signal to slurm before the job times out so that it can finish the run
+                        tasks_per_node=1,
+                        nodes=1,
+                        cpus_per_task=30, #24
+                        mem_per_cpu=4096,
+                        job_name='smac_hpo',
+                        slurm_gres=f'gpu:{1}'
+       )
+
+    return maximum_runtime  
+    # TODO: add main function to run the training for the non_HPO setup
+    # TODO: Adjust the hp pickle file saves to accomodate for the different config_spaces
+    # TODO: change the naming of models to accomodate for different config_spaces
+    # TODO: adjust that config_space is actually split into the respective variables 
+    
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+    # file system input / output
+    parser.add_argument("-s", "--slurm", type=bool, default=False, help="flag to run training on slurm") # if not provided you can just run it from terminal (for debugging)
+    parser.add_argument('-i', "--input_bin", type=str, default="dev/data/fineweb10B/fineweb_train_*.bin", help="input .bin to train on")
+    parser.add_argument('-j', "--input_val_bin", type=str, default="dev/data/fineweb10B/fineweb_val_*.bin", help="input .bin to eval validation loss on")
+    parser.add_argument('-o', "--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
+    parser.add_argument('-e', "--model_name", type=str, default="d6", help="gpt2-tiny|gpt2|gpt2-medium|gpt2-large|gpt2-xl|d6|d12|d24|d36|d48")
+    parser.add_argument('-n', "--checkpoint_every", type=int, default=0, help="save a checkpoint every N steps")
+    # token layout for each step of the optimization
+    parser.add_argument('-b', "--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
+    parser.add_argument('-t', "--sequence_length", type=int, default=1024, help="sequence length")
+    parser.add_argument('-d', "--total_batch_size", type=int, default=-1, help="total desired batch size, in units of #tokens")
+    parser.add_argument('-nh', "--n_head", type=int, default=12, help="number of attention heads")
+    parser.add_argument('-nl', "--n_layer", type=int, default=12, help="number of layers")
+    parser.add_argument('-ne', "--n_embd", type=int, default=768, help="number of embeddings")
+    # workload (number of steps)
+    parser.add_argument('-v',"--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+
+    # parser.add_argument('-x', "--num_iterations", type=int, default=-1, help="number of iterations to run")
+    # optimization
+    parser.add_argument('-l', "--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
+    parser.add_argument('-u', "--warmup_iters", type=int, default=700, help="learning rate warmup iterations")
+    parser.add_argument('-q', "--learning_rate_decay_frac", type=float, default=0.0, help="learning rate warmup iterations")
+    parser.add_argument('-c', "--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    # evaluation
+    parser.add_argument('-m', "--val_max_steps", type=int, default=500, help="how many batches of val to average?")
+    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
+    parser.add_argument('-z', "--zero_stage", type=int, default=1, help="zero redundancy optimizer stage (0/1/2/3)")
+    # python -> C bridge
+    parser.add_argument("--multiobjective", type=bool, default=False, help="multiobjective optimization")
+    parser.add_argument("--n_initial", type=int, default=5, help="number of initial configurations to evaluate")
+    parser.add_argument("--n_trials", type=int, default=500, help="number of trials to evaluate")
+    parser.add_argument("--eta", type=int, default=2, help="eta parameter for Hyperband")
+    parser.add_argument("--surrogate", type=str, default="gp", help="surrogate model to use")
+    parser.add_argument("--smac", type=bool, default=False, help="use SMAC for optimization")
+    parser.add_argument("--checkpoint", type=bool, default=True, help="load checkpoint")
+    args = parser.parse_args()
+    
+    trainer = Trainer(config_space = {}, budget=23*60*60, seed=42, **vars(args))
+        
+    if args.slurm == True:
+        print("Running on slurm")
+        global ex
+        global q
+        maximum_runtime = 0
+        log_folder = './logs_cluster/'
+        maximum_runtime = set_queue('mlhiwi', log_folder)
+        submit_func = ex.submit
+        job = submit_func(Trainer.train, trainer)
+
+        print(job)
+    else:
+        print("Running on local machine")
+        print(args.slurm)
+        Trainer.train(trainer)

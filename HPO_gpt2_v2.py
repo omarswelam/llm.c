@@ -429,6 +429,7 @@ if __name__ == "__main__":
     parser.add_argument('-j', "--input_val_bin", type=str, default="dev/data/fineweb10B/fineweb_val_*.bin", help="input .bin to eval validation loss on")
     parser.add_argument('-o', "--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument('-e', "--model", type=str, default="d6", help="gpt2-tiny|gpt2|gpt2-medium|gpt2-large|gpt2-xl|d6|d12|d24|d36|d48")
+    parser.add_argument('-n', "--checkpoint_every", type=int, default=0, help="save a checkpoint every N steps")
     # token layout for each step of the optimization
     parser.add_argument('-b', "--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     # parser.add_argument('-t', "--sequence_length", type=int, default=1024, help="sequence length")
@@ -437,6 +438,7 @@ if __name__ == "__main__":
     # parser.add_argument('-x', "--num_iterations", type=int, default=-1, help="number of iterations to run")
     # optimization
     # parser.add_argument('-l', "--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
+    # parser.add_argument('-v',"--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
     parser.add_argument('-u', "--warmup_iters", type=int, default=700, help="learning rate warmup iterations")
     parser.add_argument('-q', "--learning_rate_decay_frac", type=float, default=0.0, help="learning rate warmup iterations")
     # parser.add_argument('-c', "--weight_decay", type=float, default=0.0, help="weight decay")
