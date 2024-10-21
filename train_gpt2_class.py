@@ -103,7 +103,9 @@ class Trainer:
                  model_name: str = "d6",
                  logger_=None,
                  **kwargs):
-        # Initialize parameters        
+        # Initialize parameters  
+        print("config_space", config_space)
+        print(type(config_space))      
         self.config_space = config_space
         self.model_name = config_space['model'] if "model" in config_space.keys() else model_name
 
@@ -187,7 +189,7 @@ class Trainer:
 
     def _log_setup(self):
         section_tab = 3*"\t"
-        print(f"Running train_eval_hpo with budget: {self.budget}, config_space: {self.config_space.get_dictionary() if isinstance(self.config_space, ConfigurationSpace) else self.config_space}, seed: {self.seed}")
+        print(f"Running train_eval_hpo with budget: {self.budget}, config_space: {self.config_space.get_dictionary() if isinstance(self.config_space, Configuration) else self.config_space}, seed: {self.seed}")
         self.logger.info(f"{section_tab}== Running train_eval_hpo ==")
         # log all the arguments
         self.logger.info(f"{section_tab}== Arguments:\n"
@@ -207,7 +209,7 @@ class Trainer:
                     + section_tab + f"\tzero_stage: {self.zero_stage} \n")
         
         self.logger.info(f"{section_tab}== configuration space:\n" 
-            + section_tab + f"\tConfig_space:{self.config_space.get_dictionary() if isinstance(self.config_space, ConfigurationSpace) else self.config_space} \n")
+            + section_tab + f"\tConfig_space:{self.config_space.get_dictionary() if isinstance(self.config_space, Configuration) else self.config_space} \n")
         
         self.logger.info(f"{section_tab}== Dataloaders setup:\n"
             + section_tab + f"\ttrain_loader.ntok_total: {self.train_loader.ntok_total} \n"
@@ -219,7 +221,7 @@ class Trainer:
             project="LLMs",
             entity="o-swelam",
             config={
-                "config_space": self.config_space.get_dictionary() if isinstance(self.config_space, ConfigurationSpace) else self.config_space,
+                "config_space": self.config_space.get_dictionary() if isinstance(self.config_space, Configuration) else self.config_space,
                 "learning_rate": self.learning_rate,
                 "weight_decay": self.weight_decay,
                 "n_head": self.n_head,
