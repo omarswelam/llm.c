@@ -115,7 +115,11 @@ class SuccessiveHalvingCustom:
         self.results = []  # Stores the results of each evaluated configuration in the current rung
         self.evaluations = {}  # Dictionary to store the final performance of each configuration across all rounds
         self.config_history = []  # Stores every configuration that has been evaluated along with results
-        self.checkpoint_path = 'successive_halving_checkpoint.pkl'
+        ckpt_name = ''
+        for hp in config_space.get_hyperparameters():
+            if isinstance(hp, Constant) and hp.name != 'model':
+                ckpt_name += '_' + hp.name.split('_')[0][0] + hp.name.split('_')[1][0]
+        self.checkpoint_path = 'successive_halving_checkpoint' + ckpt_name + '.pkl'
         
         # Calculate the number of rungs (stages) in successive halving
         self.num_rungs = int(math.log(max_budget / min_budget, reduction_factor)) + 1
@@ -371,12 +375,12 @@ def main_smac(args):
     # Define the configuration space
     cs = ConfigurationSpace()
     model = Constant("model", value="custom")
-    learning_rate = UniformFloatHyperparameter("learning_rate", 1e-6, 1e-4, default_value=1e-4, log=True)
-    weight_decay = UniformFloatHyperparameter("weight_decay", 1e-6, 0.1, default_value=0.01, log=True)
-    sequence_length = UniformIntegerHyperparameter("sequence_length", 256, 1024, default_value=1024)
+    learning_rate = Constant("learning_rate", value=7.4533e-05) if args.lr_constant else UniformFloatHyperparameter("learning_rate", 1e-5, 1e-3, default_value=1e-4, log=True) ## originally 1e-6 to 1e-4
+    weight_decay = Constant("weight_decay", value=0.008) if args.wd_constant else UniformFloatHyperparameter("weight_decay", 1e-6, 0.1, default_value=0.01, log=True)
+    sequence_length = Constant("sequence_length", value=1024) if args.sl_constant else UniformIntegerHyperparameter("sequence_length", 256, 1024, default_value=1024)
     batch_size = CategoricalHyperparameter("batch_size", [1, 2, 4, 8, 16], default_value=4)
     n_head = CategoricalHyperparameter("n_head", [4, 6, 8, 10, 12], default_value=6)
-    n_layer = CategoricalHyperparameter("n_layer", [4, 6, 8], default_value=6)
+    n_layer = CategoricalHyperparameter("n_layer", [4, 6, 8, 10, 12], default_value=6)
     n_embd = CategoricalHyperparameter("n_embd", [240, 480, 720, 960, 1200], default_value=480)
     # n_embd = CategoricalHyperparameter("n_embd", [256, 384, 512, 768, 1024], default_value=384)
     cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd, model])
@@ -415,8 +419,8 @@ def main_smac(args):
     print(f"Best found configuration: {incumbents}")
     
     global log_file_name
-    pickle.dump(incumbents, open(f"{log_file_name}_incumbents_w_embedding.pkl", "wb"))
-    pickle.dump(sha, open(f"{log_file_name}_sha_w_embedding.pkl", "wb"))
+    pickle.dump(incumbents, open(f"incumbents_w_embedding.pkl", "wb"))
+    pickle.dump(sha, open(f"sha_w_embedding.pkl", "wb"))
 
 
 
@@ -428,23 +432,27 @@ if __name__ == "__main__":
     parser.add_argument('-i', "--input_bin", type=str, default="dev/data/fineweb10B/fineweb_train_*.bin", help="input .bin to train on")
     parser.add_argument('-j', "--input_val_bin", type=str, default="dev/data/fineweb10B/fineweb_val_*.bin", help="input .bin to eval validation loss on")
     parser.add_argument('-o', "--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
-    parser.add_argument('-e', "--model", type=str, default="d6", help="gpt2-tiny|gpt2|gpt2-medium|gpt2-large|gpt2-xl|d6|d12|d24|d36|d48")
+    parser.add_argument('-e', "--model_name", type=str, default="d6", help="gpt2-tiny|gpt2|gpt2-medium|gpt2-large|gpt2-xl|d6|d12|d24|d36|d48")
     parser.add_argument('-n', "--checkpoint_every", type=int, default=0, help="save a checkpoint every N steps")
     # token layout for each step of the optimization
     parser.add_argument('-b', "--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
-    # parser.add_argument('-t', "--sequence_length", type=int, default=1024, help="sequence length")
+    parser.add_argument('-t', "--sequence_length", type=int, default=1024, help="sequence length")
     parser.add_argument('-d', "--total_batch_size", type=int, default=-1, help="total desired batch size, in units of #tokens")
+    parser.add_argument('-nh', "--n_head", type=int, default=12, help="number of attention heads")
+    parser.add_argument('-nl', "--n_layer", type=int, default=12, help="number of layers")
+    parser.add_argument('-ne', "--n_embd", type=int, default=768, help="number of embeddings")
     # workload (number of steps)
+    parser.add_argument('-v',"--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+
     # parser.add_argument('-x', "--num_iterations", type=int, default=-1, help="number of iterations to run")
     # optimization
-    # parser.add_argument('-l', "--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
-    # parser.add_argument('-v',"--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+    parser.add_argument('-l', "--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
     parser.add_argument('-u', "--warmup_iters", type=int, default=700, help="learning rate warmup iterations")
     parser.add_argument('-q', "--learning_rate_decay_frac", type=float, default=0.0, help="learning rate warmup iterations")
-    # parser.add_argument('-c', "--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument('-c', "--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # evaluation
-    parser.add_argument('-m', "--val_max_steps", type=int, default=20, help="how many batches of val to average?")
+    parser.add_argument('-m', "--val_max_steps", type=int, default=500, help="how many batches of val to average?")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
     parser.add_argument('-z', "--zero_stage", type=int, default=1, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
@@ -455,6 +463,9 @@ if __name__ == "__main__":
     parser.add_argument("--surrogate", type=str, default="gp", help="surrogate model to use")
     parser.add_argument("--smac", type=bool, default=False, help="use SMAC for optimization")
     parser.add_argument("--checkpoint", type=bool, default=True, help="load checkpoint")
+    parser.add_argument("--lr_constant", type=bool, default=False, help="constant learning rate")
+    parser.add_argument("--wd_constant", type=bool, default=False, help="constant weight decay")
+    parser.add_argument("--sl_constant", type=bool, default=False, help="constant sequence length")
     args = parser.parse_args()
     
     if args.slurm == True:
