@@ -82,7 +82,7 @@ import pickle
 from contextlib import nullcontext
 
 class Trainer:
-    def __init__(self, config_space, seed, budget, 
+    def __init__(self, config_space, seed, budget, max_budget,
                  input_bin: str = "dev/data/fineweb10B/fineweb_train_*.bin",
                  input_val_bin: str = "dev/data/fineweb10B/fineweb_val_*.bin",
                  learning_rate: float = 1e-4,
@@ -94,6 +94,7 @@ class Trainer:
                  batch_size: int = 8,
                  total_batch_size: int = -1,
                  warmup_iters: int = 700,
+                 warmup_time: int = 60*60,
                  learning_rate_decay_frac: float = 0.0,
                  grad_clip: float = 1.0,
                  val_max_steps: int = 500,
@@ -102,6 +103,8 @@ class Trainer:
                  multi_objective: bool = False,
                  model_name: str = "d6",
                  logger_=None,
+                 cosine_restarts: int = 0,
+                 lr_schedule_time = False,
                  **kwargs):
         # Initialize parameters  
         print("config_space", config_space)
@@ -116,6 +119,7 @@ class Trainer:
         self.seed = seed
         self.budget = budget
         self.input_bin = input_bin
+        self.max_budget = max_budget
         self.input_val_bin = input_val_bin
         self.batch_size = self.config_space["batch_size"] if "batch_size" in self.config_space.keys() else batch_size
         self.learning_rate = self.config_space["learning_rate"] if "learning_rate" in self.config_space.keys() else learning_rate
@@ -124,8 +128,15 @@ class Trainer:
         self.n_layer = self.config_space["n_layer"] if "n_layer" in self.config_space.keys() else n_layer
         self.n_embd = self.config_space["n_embd"] if "n_embd" in self.config_space.keys() else n_embd
         self.sequence_length = self.config_space["sequence_length"] if "sequence_length" in self.config_space.keys() else sequence_length
-        self.warmup_iters = warmup_iters
-        self.learning_rate_decay_frac = learning_rate_decay_frac
+        ####
+        self.warmup_iters = self.config_space["warmup_iters"] if "warmup_iters" in self.config_space.keys() else warmup_iters
+        self.warmup_time = self.config_space["warmup_time"] if "warmup_time" in self.config_space.keys() else warmup_time
+        self.learning_rate_decay_frac = self.config_space["learning_rate_decay_frac"] if "learning_rate_decay_frac" in self.config_space.keys() else learning_rate_decay_frac
+        self.cosine_restarts = self.config_space["cosine_restarts"] if "cosine_restarts" in self.config_space.keys() else cosine_restarts
+        self.cosine_restarts += 1
+        self.cosine_cycle_length = self.max_budget / self.cosine_restarts
+        self.lr_schedule_time = lr_schedule_time
+        ###
         self.grad_clip = grad_clip
         self.val_max_steps = val_max_steps
         self.dtype = dtype
@@ -134,9 +145,16 @@ class Trainer:
         self.ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 
         if str(self.model_name) == "custom":
-            self.save_name = str(self.model_name) \
-                + f"_lr_{self.learning_rate}_wd_{self.weight_decay}_sl_{self.sequence_length}_bs_{self.batch_size}_" \
-                + f"h_{self.n_head}_l_{self.n_layer}_em_{self.n_embd}"
+            self.save_name = str(self.model_name)
+            for key in self.config_space.keys():
+                self.save_name += "_"
+                for initial_letter in key.split("_"):
+                    self.save_name += initial_letter
+                self.save_name += f"_{self.config_space[key]}"
+            
+            print("save_name", self.save_name)
+                # + f"_lr_{self.learning_rate}_wd_{self.weight_decay}_sl_{self.sequence_length}_bs_{self.batch_size}_" \
+                # + f"h_{self.n_head}_l_{self.n_layer}_em_{self.n_embd}"
         else:
             self.save_name = str(self.model_name) \
                 + f"_lr_{self.learning_rate}_wd_{self.weight_decay}_sl_{self.sequence_length}_bs_{self.batch_size}" 
@@ -336,6 +354,21 @@ class Trainer:
         coeff = 0.5 * (1.0 + np.cos(np.pi * decay_ratio))
         return min_lr + coeff * (self.learning_rate - min_lr)
 
+        
+    def _get_lr_time(self, time_spent, T_0):
+        min_lr = self.learning_rate * self.learning_rate_decay_frac        
+        if time_spent < self.warmup_time:
+            return self.learning_rate * (time_spent + 0.001) / self.warmup_time
+
+        time_spent_after_warmup = time_spent - self.warmup_time
+
+        time_within_period = time_spent_after_warmup % T_0 
+
+        decay_ratio = time_within_period / T_0
+        coeff = 0.5 * (1.0 + np.cos(np.pi * decay_ratio))        
+        lr = min_lr + coeff * (self.learning_rate - min_lr)
+        return lr
+
     def _save_model(self, step, start_time, optimizer):
         ckpt = {
             'model_state_dict': self.model.state_dict() if not self.ddp else self.model.module.state_dict(),
@@ -412,7 +445,7 @@ class Trainer:
             lossf = lossf.item()
 
             norm = torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.grad_clip)
-            lr = trainer._get_lr(trainer.step, num_iterations)
+            lr = trainer._get_lr(trainer.step, num_iterations) if not trainer.lr_schedule_time else trainer._get_lr_time(trainer.time_elapsed + time.time() - start_time, trainer.cosine_cycle_length)
             for param_group in trainer.optimizer.param_groups:
                 param_group['lr'] = lr
 

@@ -383,8 +383,17 @@ def main_smac(args):
     n_layer = CategoricalHyperparameter("n_layer", [4, 6, 8, 10, 12], default_value=6)
     n_embd = CategoricalHyperparameter("n_embd", [240, 480, 720, 960, 1200], default_value=480)
     # n_embd = CategoricalHyperparameter("n_embd", [256, 384, 512, 768, 1024], default_value=384)
-    cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd, model])
+    
+    # warmup_iters = Constant("warmup_iters", value=700) if args.warmup_constant else UniformIntegerHyperparameter("warmup_iters", 500, 1000, default_value=700)
+    # warmup_time = Constant("warmup_time", value=60*60) if args.warmup_constant else UniformIntegerHyperparameter("warmup_time", 10*60, 60*60, default_value=60*60)
+    # learning_rate_decay_frac = Constant("learning_rate_decay_frac", value=0.0) if args.lr_decay_constant else UniformFloatHyperparameter("learning_rate_decay_frac", 0.0, 0.2, default_value=0.0)
+    # cosine_restarts = Constant("cosine_restarts", value=0) if args.cosine_constant else UniformIntegerHyperparameter("cosine_restarts", 0, 4, default_value=0)
+    
+    # cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd, model, 
+    #                         warmup_iters, warmup_time, learning_rate_decay_frac, cosine_restarts])
 
+    cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd, model])
+    
     print(f"{'using SMAC for optimization' if args.smac else 'using Successive Halving for optimization'}")
     
     if args.smac:
@@ -398,7 +407,7 @@ def main_smac(args):
         info = sha.ask()
         assert info.seed is not None
         # print(info)
-        experiment = Trainer(info.config, budget=info.budget, seed=info.seed, logger_=logger)
+        experiment = Trainer(info.config, budget=info.budget, seed=info.seed, logger_=logger, max_budget=23*60*60, lr_schedule_time=True)
         try:
             cost = Trainer.train(experiment)
             exception = ""
