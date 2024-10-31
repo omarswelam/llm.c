@@ -159,6 +159,7 @@ class Trainer:
             self.save_name = str(self.model_name) \
                 + f"_lr_{self.learning_rate}_wd_{self.weight_decay}_sl_{self.sequence_length}_bs_{self.batch_size}" 
                 
+        self.save_name += "_v2"
         self.step = 0
         self.time_elapsed = 0.0
         # Initialize WandB

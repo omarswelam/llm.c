@@ -96,7 +96,7 @@ def plot_pareto(smac: AbstractFacade, incumbents: list[Configuration]) -> None:
     
     
 class SuccessiveHalvingCustom:
-    def __init__(self, config_space, min_budget, max_budget, logger, reduction_factor=2, n_initial=1, seed=42):
+    def __init__(self, config_space, min_budget, max_budget, logger, reduction_factor=2, n_initial=1, seed=42, lr_schedule_time=False):
         """
         Initialize the Successive Halving algorithm.
 
@@ -115,7 +115,8 @@ class SuccessiveHalvingCustom:
         self.results = []  # Stores the results of each evaluated configuration in the current rung
         self.evaluations = {}  # Dictionary to store the final performance of each configuration across all rounds
         self.config_history = []  # Stores every configuration that has been evaluated along with results
-        ckpt_name = ''
+        self.lr_schedule_time = lr_schedule_time
+        ckpt_name = '_time' if lr_schedule_time else ''
         for hp in config_space.get_hyperparameters():
             if isinstance(hp, Constant) and hp.name != 'model':
                 ckpt_name += '_' + hp.name.split('_')[0][0] + hp.name.split('_')[1][0]
@@ -138,8 +139,7 @@ class SuccessiveHalvingCustom:
         self.logger.info(f"\t min_budget: {min_budget}")
         self.logger.info(f"\t max_budget: {max_budget}")
         self.logger.info(f"\t num_rungs: {self.num_rungs}")
-
-    
+ 
     def ask(self):
         """
         Return the next configuration to evaluate with the current budget.
@@ -382,24 +382,23 @@ def main_smac(args):
     n_head = CategoricalHyperparameter("n_head", [4, 6, 8, 10, 12], default_value=6)
     n_layer = CategoricalHyperparameter("n_layer", [4, 6, 8, 10, 12], default_value=6)
     n_embd = CategoricalHyperparameter("n_embd", [240, 480, 720, 960, 1200], default_value=480)
-    # n_embd = CategoricalHyperparameter("n_embd", [256, 384, 512, 768, 1024], default_value=384)
     
-    # warmup_iters = Constant("warmup_iters", value=700) if args.warmup_constant else UniformIntegerHyperparameter("warmup_iters", 500, 1000, default_value=700)
-    # warmup_time = Constant("warmup_time", value=60*60) if args.warmup_constant else UniformIntegerHyperparameter("warmup_time", 10*60, 60*60, default_value=60*60)
-    # learning_rate_decay_frac = Constant("learning_rate_decay_frac", value=0.0) if args.lr_decay_constant else UniformFloatHyperparameter("learning_rate_decay_frac", 0.0, 0.2, default_value=0.0)
-    # cosine_restarts = Constant("cosine_restarts", value=0) if args.cosine_constant else UniformIntegerHyperparameter("cosine_restarts", 0, 4, default_value=0)
+    warmup_iters = Constant("warmup_iters", value=700) if args.warmup_constant else UniformIntegerHyperparameter("warmup_iters", 500, 1000, default_value=700)
+    warmup_time = Constant("warmup_time", value=60*60) if args.warmup_constant else UniformIntegerHyperparameter("warmup_time", 10*60, 60*60, default_value=60*60)
+    learning_rate_decay_frac = Constant("learning_rate_decay_frac", value=0.0) if args.lr_decay_constant else UniformFloatHyperparameter("learning_rate_decay_frac", 0.0, 0.2, default_value=0.0)
+    cosine_restarts = Constant("cosine_restarts", value=0) if args.cosine_constant else UniformIntegerHyperparameter("cosine_restarts", 0, 4, default_value=0)
     
-    # cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd, model, 
-    #                         warmup_iters, warmup_time, learning_rate_decay_frac, cosine_restarts])
+    cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd, model, 
+                            warmup_iters, warmup_time, learning_rate_decay_frac, cosine_restarts])
 
-    cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd, model])
+    # cs.add_hyperparameters([learning_rate, weight_decay, sequence_length, batch_size, n_head, n_layer, n_embd, model])
     
     print(f"{'using SMAC for optimization' if args.smac else 'using Successive Halving for optimization'}")
     
     if args.smac:
         sha = smac_object(args, cs, logger)
     else:
-        sha = SuccessiveHalvingCustom(cs, min_budget=20*60, max_budget=23*60*60, logger=logger, reduction_factor=args.eta, n_initial=100)
+        sha = SuccessiveHalvingCustom(cs, min_budget=20*60, max_budget=23*60*60, logger=logger, reduction_factor=args.eta, n_initial=100, lr_schedule_time=args.time)
         if args.checkpoint:
             sha.load_state()
     
@@ -407,7 +406,7 @@ def main_smac(args):
         info = sha.ask()
         assert info.seed is not None
         # print(info)
-        experiment = Trainer(info.config, budget=info.budget, seed=info.seed, logger_=logger, max_budget=23*60*60, lr_schedule_time=True)
+        experiment = Trainer(info.config, budget=info.budget, seed=info.seed, logger_=logger, max_budget=23*60*60, lr_schedule_time=args.time)
         try:
             cost = Trainer.train(experiment)
             exception = ""
@@ -475,6 +474,10 @@ if __name__ == "__main__":
     parser.add_argument("--lr_constant", type=bool, default=False, help="constant learning rate")
     parser.add_argument("--wd_constant", type=bool, default=False, help="constant weight decay")
     parser.add_argument("--sl_constant", type=bool, default=False, help="constant sequence length")
+    parser.add_argument("--warmup_constant", type=bool, default=False, help="constant warmup iterations")
+    parser.add_argument("--lr_decay_constant", type=bool, default=False, help="constant learning rate decay fraction")
+    parser.add_argument("--cosine_constant", type=bool, default=False, help="constant cosine restarts")
+    parser.add_argument("--time", type=bool, default=False, help="schedule learning rate by time")
     args = parser.parse_args()
     
     if args.slurm == True:
